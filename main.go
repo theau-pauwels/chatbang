@@ -11,13 +11,22 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 
 	markdown "github.com/MichaelMure/go-term-markdown"
 )
 
 const ctxTime = 2000
+const maxCopyRetries = 30
+
+// filteredErrorf suppresses noisy CDP events that chromedp doesn't handle yet.
+func filteredErrorf(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	if strings.Contains(msg, "EventTopLayerElementsUpdated") {
+		return
+	}
+	log.Printf(format, v...)
+}
 
 // a list of all possible common executable names
 // for chromium-based browsers.
@@ -89,6 +98,7 @@ func main() {
 
 	// read browser from config
 	var defaultBrowser string
+	var projectSlug string
 	scanner := bufio.NewScanner(configFile)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -96,8 +106,14 @@ func main() {
 			continue
 		}
 		parts := strings.SplitN(line, "=", 2)
-		if len(parts) == 2 && strings.TrimSpace(parts[0]) == "browser" {
-			defaultBrowser = strings.TrimSpace(parts[1])
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			if key == "browser" {
+				defaultBrowser = val
+			} else if key == "project" {
+				projectSlug = val
+			}
 		}
 	}
 
@@ -159,14 +175,26 @@ func main() {
 
 	defer cancel()
 
-	ctx, cancel := chromedp.NewContext(allocatorCtx)
+	ctx, cancel := chromedp.NewContext(allocatorCtx,
+		chromedp.WithErrorf(filteredErrorf),
+	)
 	defer cancel()
 
 	taskCtx, taskCancel := context.WithTimeout(ctx, ctxTime*time.Second)
 	defer taskCancel()
 
+	// Build the navigation URL. If a project is configured, use its URL.
+	chatURL := "https://chatgpt.com"
+	if projectSlug != "" {
+		if strings.HasPrefix(projectSlug, "http") {
+			chatURL = projectSlug
+		} else {
+			chatURL = "https://chatgpt.com/" + projectSlug
+		}
+	}
+
 	err = chromedp.Run(taskCtx,
-		chromedp.Navigate(`https://chatgpt.com`),
+		chromedp.Navigate(chatURL),
 	)
 
 	if err != nil {
@@ -191,11 +219,40 @@ func runChatGPT(taskCtx context.Context, browserPath string, profileDir string, 
 
 	buttonDiv := `button[data-testid="copy-turn-action-button"]`
 
-	modifiedPrompt := firstPrompt + " (Make an answer in less than 5 lines)."
-	var copiedText string
-	result := markdown.Render(string(modifiedPrompt), 80, 2)
+	modifiedPrompt := firstPrompt
+	var responseText string
 
-	js := `new Promise((resolve, reject) => { window.navigator.clipboard.readText() .then(text => resolve(text)) .catch(err => reject(err)); });`
+	// Intercept clipboard writes AND copy events so we can capture the
+	// markdown without needing the transient clipboard-read permission.
+	hookJS := `(() => {
+		window.__cb_text = '';
+		const orig = navigator.clipboard.writeText.bind(navigator.clipboard);
+		navigator.clipboard.writeText = (text) => {
+			window.__cb_text = text;
+			return orig(text);
+		};
+		document.addEventListener('copy', (e) => {
+			const data = e.clipboardData && e.clipboardData.getData('text/plain');
+			if (data) window.__cb_text = data;
+		});
+	})()`
+
+	// Read the intercepted text. DOM fallback skips thinking blocks.
+	readJS := `(() => {
+		if (window.__cb_text && window.__cb_text.length > 0) {
+			return window.__cb_text;
+		}
+		// Fallback: extract from last assistant message, excluding thinking
+		let msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			let clone = msgs[i].cloneNode(true);
+			// Remove thinking / reasoning blocks
+			clone.querySelectorAll('[data-testid="message-thinking"], .thinking, [class*="thinking"]').forEach(e => e.remove());
+			let text = clone.innerText && clone.innerText.trim();
+			if (text && text.length > 10) return text;
+		}
+		return '';
+	})()`
 
 	err := chromedp.Run(taskCtx,
 		chromedp.WaitVisible(`#prompt-textarea`, chromedp.ByID),
@@ -205,45 +262,72 @@ func runChatGPT(taskCtx context.Context, browserPath string, profileDir string, 
 		chromedp.Click(`#prompt-textarea`, chromedp.ByID),
 	)
 
-	for {
-		if copiedText != modifiedPrompt && len(copiedText) > 0 {
+	for retries := 0; retries < maxCopyRetries; retries++ {
+		if responseText != "" && responseText != modifiedPrompt {
 			break
 		}
-		// because it's sometimes doesn't see the very last copy button
-		// so it copies the prompt instead
 		err = chromedp.Run(taskCtx,
-			//chromedp.Sleep(1*time.Second),
+			chromedp.Sleep(4*time.Second),
 			chromedp.WaitVisible(buttonDiv, chromedp.ByQuery),
 
+			// Inject the clipboard hook
+			chromedp.Evaluate(hookJS, nil),
+
+			// Click the last copy button (triggers writeText)
 			chromedp.Evaluate(fmt.Sprintf(`
-				(() => {
-				    let buttons = document.querySelectorAll('%s');
-				    if (buttons.length > 0) {
-					buttons[buttons.length - 1].click();
-				    }
-				})()
-			    `, buttonDiv), nil),
+					(() => {
+					    let buttons = document.querySelectorAll('%s');
+					    if (buttons.length > 0) {
+						buttons[buttons.length - 1].click();
+					    }
+					})()
+				    `, buttonDiv), nil),
 
-			// Read clipboard
-			chromedp.Evaluate(js, &copiedText, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
-				return p.WithAwaitPromise(true)
-			}),
+			chromedp.Sleep(500*time.Millisecond),
+			// Read the intercepted text (with DOM fallback)
+			chromedp.Evaluate(readJS, &responseText),
 		)
+		if err != nil {
+			break
+		}
 
-		result = markdown.Render(string(copiedText), 80, 2)
+		// ChatGPT streams: copy button appears early. Re-capture after
+		// a delay to get the complete response.
+		if responseText != "" && responseText != modifiedPrompt {
+			chromedp.Run(taskCtx,
+				chromedp.Sleep(2*time.Second),
+				chromedp.Evaluate(fmt.Sprintf(`
+						(() => {
+						    let buttons = document.querySelectorAll('%s');
+						    if (buttons.length > 0) {
+							buttons[buttons.length - 1].click();
+						    }
+						})()
+					    `, buttonDiv), nil),
+				chromedp.Sleep(500*time.Millisecond),
+				chromedp.Evaluate(readJS, &responseText),
+			)
+		}
 	}
 
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	if responseText == "" || responseText == modifiedPrompt {
+		log.Fatal("Failed to get a response from ChatGPT — the page structure may have changed.")
+	}
+
+	fmt.Fprintf(os.Stderr, "\n[DEBUG captured %d chars]: %q\n\n", len(responseText), responseText[:min(len(responseText), 200)])
+
+	result := markdown.Render(responseText, 80, 2)
 	fmt.Println(string(result))
 
 	fmt.Print("> ")
 	promptScanner := bufio.NewScanner(os.Stdin)
 	for promptScanner.Scan() {
 		prompt := promptScanner.Text()
-		modifiedPrompt = prompt + " (Make an answer in less than 5 lines)."
+		modifiedPrompt = prompt
 		if len(prompt) == 0 {
 			fmt.Print("> ")
 			continue
@@ -263,38 +347,62 @@ func runChatGPT(taskCtx context.Context, browserPath string, profileDir string, 
 			log.Fatal(err)
 		}
 
-		result = markdown.Render(string(copiedText), 80, 2)
+		responseText := ""
 
-		copiedText = ""
-
-		for {
-			if copiedText != modifiedPrompt && len(copiedText) > 0 {
+		for retries := 0; retries < maxCopyRetries; retries++ {
+			if responseText != "" && responseText != modifiedPrompt {
 				break
 			}
-			// because it's sometimes doesn't see the very last copy button
-			// so it copies the prompt instead
 
 			err = chromedp.Run(taskCtx,
-				chromedp.Sleep(3*time.Second),
+				chromedp.Sleep(4*time.Second),
+
+				// Inject the clipboard hook
+				chromedp.Evaluate(hookJS, nil),
+
+				// Click the last copy button (triggers writeText)
 				chromedp.Evaluate(fmt.Sprintf(`
-					(() => {
-					    let buttons = document.querySelectorAll('%s');
-					    if (buttons.length > 0) {
-						buttons[buttons.length - 1].click();
-					    }
-					})()
-				    `, buttonDiv), nil),
+						(() => {
+						    let buttons = document.querySelectorAll('%s');
+						    if (buttons.length > 0) {
+							buttons[buttons.length - 1].click();
+						    }
+						})()
+					    `, buttonDiv), nil),
 
 				chromedp.Sleep(1*time.Second),
-				// Read clipboard
-				chromedp.Evaluate(js, &copiedText, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
-					return p.WithAwaitPromise(true)
-				}),
+				// Read the intercepted text (with DOM fallback)
+				chromedp.Evaluate(readJS, &responseText),
 			)
+			if err != nil {
+				break
+			}
 
-			result = markdown.Render(string(copiedText), 80, 2)
+			// Re-capture after a delay for complete response.
+			if responseText != "" && responseText != modifiedPrompt {
+				chromedp.Run(taskCtx,
+					chromedp.Sleep(2*time.Second),
+					chromedp.Evaluate(fmt.Sprintf(`
+								(() => {
+								    let buttons = document.querySelectorAll('%s');
+								    if (buttons.length > 0) {
+									buttons[buttons.length - 1].click();
+								    }
+								})()
+							    `, buttonDiv), nil),
+					chromedp.Sleep(500*time.Millisecond),
+					chromedp.Evaluate(readJS, &responseText),
+				)
+			}
 		}
 
+		if responseText == "" || responseText == modifiedPrompt {
+			log.Fatal("Failed to get a response from ChatGPT — the page structure may have changed.")
+		}
+
+		fmt.Fprintf(os.Stderr, "\n[DEBUG captured %d chars]: %q\n\n", len(responseText), responseText[:min(len(responseText), 200)])
+
+		result := markdown.Render(responseText, 80, 2)
 		fmt.Println(string(result))
 
 		fmt.Print("> ")
@@ -322,7 +430,9 @@ func loginProfile(defaultBrowser string, profileDir string) {
 
 	defer cancel()
 
-	ctx, cancel := chromedp.NewContext(allocatorCtx)
+	ctx, cancel := chromedp.NewContext(allocatorCtx,
+		chromedp.WithErrorf(filteredErrorf),
+	)
 	defer cancel()
 
 	taskCtx, taskCancel := context.WithTimeout(ctx, ctxTime*time.Second)
